@@ -1,23 +1,51 @@
 import dataclasses
+import datetime
 import mysql.connector
 import matplotlib.pyplot as plt
 from mysqlSecrets import databaseLoginSecrets, MySQLSecrets
 
-@dataclasses.dataclass
-class AbgasTemperatur:
-    time: int          # Unix Timestamp
-    temperatur: float
-    temperaturGradient: float = 0.0
-    brennerStatus: bool | None = None
+PAR_DEFINE_MAX_SAMPLES_PROCESSED_PER_RUN = 6000
+
+PAR_DEFINE_GRADIENT_THRESHOLD_HEATING = 0.5 # in °C/s, if the temperature gradient is above this threshold, it is likely that the burner is active
+PAR_DEFINE_GRADIENT_THRESHOLD_COOLING = -0.5 # in °C/s, if the temperature gradient is below this threshold, it is likely that the burner is inactive   
+
+# only relevant for the first sample, if there is no previous sample to compare the gradient with, the temperature itself can be used to determine the burner status, as a high temperature (e.g. above 125°C) is a strong indicator for an active burner
+PAR_DEFINE_EXHAUST_TEMPERATURE_ON_THRESHOLD = 125.0 # in °C, if the temperature is above this threshold, it is likely that the burner is active
 
 @dataclasses.dataclass
-class BrennerStatus:
+class exhaustTemperatureSample:
+    id: int         # ID of the database entry
+    time: int          # Unix Timestamp
+    temperature: float
+    processed: bool | None = None # flag if the sample has been processed for analysis
+
+@dataclasses.dataclass
+class exhaustTemperatureGradientSample:
+    id: int         # ID of the database entry
+    time: int          # Unix Timestamp
+    gradient: float
+
+@dataclasses.dataclass
+class oilBurnerStatus:
+    id: int            # ID of the database entry
     time: int          # start time of the status
     status: bool
-    period: int | None = None  # duration of the status in seconds
 
 @dataclasses.dataclass
-class brennerStatistik:
+class oilBurnerPulse:
+    id: int        # ID of the database entry
+    time: int      # Unix Timestamp (start of the status period)
+    status: bool
+    duration: int  # duration in seconds   
+
+@dataclasses.dataclass
+class oilBurnerStatusEvent:
+    id: int        # ID of the database entry (same as the brennerStatus sample id)
+    time: int      # Unix Timestamp of the status change
+    status: bool   # new status after the change
+
+@dataclasses.dataclass
+class oilBurnerStatistics:
     gesamtdauerAktiv: int = 0
     gesamtdauerInaktiv: int = 0
     starts: int = 0
@@ -27,21 +55,609 @@ class brennerStatistik:
 
 
 
-BrennerStatistikDaten: brennerStatistik = brennerStatistik()
-BrennerStatusDaten: list[BrennerStatus] = []
-AbgasTemperaturDaten: list[AbgasTemperatur] = []
+oilBurnerStatisticsData: oilBurnerStatistics = oilBurnerStatistics()
+oilBurnerStatusData: list[oilBurnerStatus] = []
+exhaustTemperatureData: list[exhaustTemperatureSample] = []
+oilBurnerPulseData: list[oilBurnerPulse] = []
+
+def exhaustTemperatureAnalysis():
+
+    if isNewExhaustSampleAvailable():
+        print("New exhaust temperature sample available, processing...")
+        processNewExhaustSamples()
+
+    if isNewGradientSampleAvailable():
+        print("New exhaust temperature gradient sample available, processing...")
+        processNewGradientSamples()
+
+    if isNewBurnerStatusSampleAvailable():
+        print("New burner status sample available, processing...")
+        processNewBurnerStatusSamples()
 
 
-def brennerStatusAnalyse():
-    global AbgasTemperaturDaten
+def processNewGradientSamples():
+    samplesProcessed = 0
+    while isNewGradientSampleAvailable():
+        if samplesProcessed >= PAR_DEFINE_MAX_SAMPLES_PROCESSED_PER_RUN:
+            print(f"Processed {samplesProcessed} gradient samples, reaching the maximum limit for this run.")
+            break
+        else:
+            processGradientSample()
+            samplesProcessed += 1
 
-    print(isNewExhaustSampleAvailable())
+def processNewExhaustSamples():
+    samplesProcessed = 0
+    while isNewExhaustSampleAvailable():
+        if samplesProcessed >= PAR_DEFINE_MAX_SAMPLES_PROCESSED_PER_RUN:
+            print(f"Processed {samplesProcessed} temperatue samples, reaching the maximum limit for this run.")
+            break
+        else:
+            proccessExhaustSample()
+            samplesProcessed += 1
 
 
-    #leseAbgasTemperatur()
-    #berechneBrennerStatus()
-    #analysiereBrennerNutzung()
-    #plotBrennerStatus()
+def processNewBurnerStatusSamples():
+    samplesProcessed = 0
+    while isNewBurnerStatusSampleAvailable():
+        if samplesProcessed >= PAR_DEFINE_MAX_SAMPLES_PROCESSED_PER_RUN:
+            print(f"Processed {samplesProcessed} burner status samples, reaching the maximum limit for this run.")
+            break
+        else:
+            processNewBurnerStatusSample()
+            samplesProcessed += 1
+    
+
+def processNewBurnerStatusSample():
+    newSample = getUnprocessedBurnerStatusSample()
+
+    if newSample.id == getFirstBurnerStatusSampleId():
+        print("This is the first burner status sample, no previous sample to compare with, skipping processing for this sample...")
+        markBurnerStatusAsProcessed(newSample.id)
+    elif burnerStatusSampleExists(newSample.id-1):
+        print("Previous burner status sample exists, processing new sample...")
+        previousSample = getBurnerStatusSampleById(newSample.id-1)
+
+        if previousSample.status == False and newSample.status == True:
+            print("Burner status changed from inactive to active, inserting status event...")
+            event = oilBurnerStatusEvent(id=newSample.id, time=newSample.time, status=True)
+            insertBurnerStatusEvent(event)
+            print("Inserted burner status event (ON) into the database.")
+        elif previousSample.status == True and newSample.status == False:
+            print("Burner status changed from active to inactive, inserting status event...")
+            event = oilBurnerStatusEvent(id=newSample.id, time=newSample.time, status=False)
+            insertBurnerStatusEvent(event)
+            print("Inserted burner status event (OFF) into the database.")
+        else:
+            print(f"No burner status change detected at sample ID {newSample.id}, skipping event insertion.")
+
+        markBurnerStatusAsProcessed(newSample.id)
+        print(f"Burner status sample {newSample.id} marked as processed.")
+    else:
+        print(f"Previous burner status sample {newSample.id-1} not found, skipping processing for now.")
+
+def processGradientSample():
+    newSample = getUnprocessedGradientSample()
+
+    print(f"Processing new exhaust temperature gradient sample with ID {newSample.id} and gradient {newSample.gradient}°C/s at time {datetime.datetime.fromtimestamp(newSample.time).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # check if previous gradient sample exists for the analysis
+    if newSample.id == getFirstGradientSampleId():
+        # check if temperature is above 125°C, which indicates that the burner is likely active
+        print("This is the first gradient sample, checking if the corresponding temperature sample indicates an active burner...")
+        exhaustTemperature = getExhaustSampleById(newSample.id).temperature
+        if exhaustTemperature > PAR_DEFINE_EXHAUST_TEMPERATURE_ON_THRESHOLD:
+            print("Burner is likely active based on the temperature sample.")
+            burnerStatus = True
+        else:
+            print("Burner is likely inactive based on the temperature sample.")
+            burnerStatus = False
+        
+        oilBurnerStatusSample = oilBurnerStatus(id=newSample.id, time=newSample.time, status=burnerStatus)
+
+        insertBurnerStatusSample(oilBurnerStatusSample)
+        print("Inserted burner status sample into the database.")
+
+        markBurnerStatusSampleAsProcessed(newSample.id)
+        print(f"Gradient sample {newSample.id} marked as processed.")
+    elif newSample.gradient > PAR_DEFINE_GRADIENT_THRESHOLD_HEATING:
+        print("Burner is likely active based on the temperature gradient.")
+        burnerStatus = True
+        oilBurnerStatusSample = oilBurnerStatus(id=newSample.id, time=newSample.time, status=burnerStatus)
+        insertBurnerStatusSample(oilBurnerStatusSample)
+        print("Inserted burner status sample into the database.")
+
+        markBurnerStatusSampleAsProcessed(newSample.id)
+        print(f"Gradient sample {newSample.id} marked as processed.")
+    elif newSample.gradient < PAR_DEFINE_GRADIENT_THRESHOLD_COOLING:
+        print("Burner is likely inactive based on the temperature gradient.")
+        burnerStatus = False
+        oilBurnerStatusSample = oilBurnerStatus(id=newSample.id, time=newSample.time, status=burnerStatus)
+        insertBurnerStatusSample(oilBurnerStatusSample)
+        print("Inserted burner status sample into the database.")
+
+        markBurnerStatusSampleAsProcessed(newSample.id)
+        print(f"Gradient sample {newSample.id} marked as processed.")
+    else:
+        #try to read the element before and copy its status, as the gradient is not significant enough to determine a status change
+        print("Temperature gradient is not significant enough to determine a status change, trying to copy the previous status if available...")
+        previousGradientSample = getExhaustSampleById(newSample.id-1)
+
+        if previousGradientSample is not None:
+            previousStatusSample = getBurnerStatusSampleById(previousGradientSample.id)
+
+            if previousStatusSample is not None:
+                print("Previous status sample found, copying the status to the new sample.")
+                oilBurnerStatusSample = oilBurnerStatus(id=newSample.id, time=newSample.time, status=previousStatusSample.status)
+                insertBurnerStatusSample(oilBurnerStatusSample)
+                print("Inserted burner status sample into the database.")
+
+                markBurnerStatusSampleAsProcessed(newSample.id)
+                print(f"Gradient sample {newSample.id} marked as processed.")
+            else:
+                print("No previous status sample found, skipping this gradient sample for now.")
+        else:
+            print("No previous gradient sample found, skipping this gradient sample for now.")
+            
+
+
+def proccessExhaustSample():
+    newSample = getUnprocessedExhaustSample()
+
+    print(f"Processing new exhaust temperature sample with ID {newSample.id} and temperature {newSample.temperature}°C at time {datetime.datetime.fromtimestamp(newSample.time).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # check if the next sample exists for the gradient calculation
+    if exhaustSampleExists(newSample.id+1):
+        print("element and next element exist, processing sample...")
+        nextSample = getExhaustSampleById(newSample.id+1)
+
+        gradient = calculateTemperatureGradient(newSample, nextSample)
+        gradientSample = exhaustTemperatureGradientSample(id=newSample.id, time=newSample.time, gradient=gradient)
+
+        print(f"Calculated temperature gradient: {gradientSample.gradient:.2f} °C/s")
+
+        insertGradientSample(gradientSample)
+        print("Inserted temperature gradient sample into the database.")
+
+        markExhaustSampleAsProcessed(newSample.id)
+        print(f"Sample {newSample.id} marked as processed.")
+    else:
+        print("Next sample does not exist yet, skipping processing for this sample.")
+
+
+
+def markExhaustSampleAsProcessed(sample_id: int):
+    """ Marks the exhaust temperature sample with the given id as processed in the database. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.abgastemperatur
+        SET processed = TRUE
+        WHERE id = %s
+    """, (sample_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def insertBurnerStatusSample(sample: oilBurnerStatus):
+    """ Inserts an oil burner status sample into the brennerStatus table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO oelheizung.brennerStatus (id, time, status)
+        VALUES (%s, FROM_UNIXTIME(%s), %s)
+    """, (sample.id, sample.time, sample.status))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def markBurnerStatusAsProcessed(burner_status_id: int):
+    """ Marks the burner status sample with the given id as processed in the brennerStatus table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.brennerStatus
+        SET processed = TRUE
+        WHERE id = %s
+    """, (burner_status_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def insertBurnerStatusEvent(event: oilBurnerStatusEvent):
+    """ Inserts a burner status change event into the brennerStatusEvent table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO oelheizung.brennerStatusEvent (id, time, status)
+        VALUES (%s, FROM_UNIXTIME(%s), %s)
+    """, (event.id, event.time, event.status))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def markBurnerStatusSampleAsProcessed(gradient_sample_id: int):
+    """ Marks the gradient sample with the given id as processed in the abgastemperaturGradient table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.abgastemperaturGradient
+        SET processed = TRUE
+        WHERE id = %s
+    """, (gradient_sample_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def insertGradientSample(gradientSample: exhaustTemperatureGradientSample):
+    """ Inserts an exhaust temperature gradient sample into the abgastemperaturGradient table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT IGNORE INTO oelheizung.abgastemperaturGradient (id, time, gradient)
+        VALUES (%s, FROM_UNIXTIME(%s), %s)
+    """, (gradientSample.id, gradientSample.time, gradientSample.gradient))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def calculateTemperatureGradient(firstSample: exhaustTemperatureSample, secondSample: exhaustTemperatureSample) -> float:
+    """Calculates the temperature gradient between two exhaust temperature samples."""
+    timeDifference = secondSample.time - firstSample.time
+    if timeDifference == 0:
+        return 0.0
+    temperatureDifference = secondSample.temperature - firstSample.temperature
+    return temperatureDifference / timeDifference
+
+def getExhaustSampleById(sample_id: int) -> exhaustTemperatureSample | None:
+    """ This function reads the exhaust temperature sample with the given id from the database and returns it as an AbgasTemperatur object. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), temperatur, processed
+        FROM oelheizung.abgastemperatur
+        WHERE id = %s
+    """, (sample_id,))
+
+    row = cursor.fetchone()
+
+    if row is not None:
+        sample = exhaustTemperatureSample(id=row[0], time=row[1], temperature=row[2], processed=row[3])
+    else:
+        sample = None
+
+    cursor.close()
+    conn.close()
+
+    return sample
+
+
+def getBurnerStatusSampleById(sample_id: int) -> oilBurnerStatus | None:
+    """ Reads the burner status sample with the given id from the brennerStatus table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), status
+        FROM oelheizung.brennerStatus
+        WHERE id = %s
+        LIMIT 1
+    """, (sample_id,))
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is not None:
+        return oilBurnerStatus(id=row[0], time=row[1], status=bool(row[2]))
+    return None
+
+
+def getFirstBurnerStatusSampleId() -> int | None:
+    """ Returns the id of the first (smallest id) burner status sample in the database, or None if the table is empty. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id
+        FROM oelheizung.brennerStatus
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return row[0] if row else None
+
+
+def getFirstGradientSampleId() -> int | None:
+    """ Returns the id of the first (smallest id) gradient sample in the database, or None if the table is empty. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id
+        FROM oelheizung.abgastemperaturGradient
+        ORDER BY id ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return row[0] if row else None
+
+
+def getUnprocessedBurnerStatusSample() -> oilBurnerStatus | None:
+    """ Reads the first unprocessed burner status sample from the brennerStatus table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), status
+        FROM oelheizung.brennerStatus
+        WHERE processed IS NULL OR processed = FALSE
+        ORDER BY time ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is not None:
+        return oilBurnerStatus(id=row[0], time=row[1], status=bool(row[2]))
+    return None
+
+
+def getUnprocessedGradientSample():
+    """ This function reads the first element of the oelheizung.abgastemperaturGradient table which
+    has a processed value of NULL and returns it as an exhaustTemperatureGradientSample object.
+      After reading the sample, it sets the processed value to the current timestamp to mark it as processed. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), gradient
+        FROM oelheizung.abgastemperaturGradient
+        WHERE processed IS NULL OR processed = FALSE
+        ORDER BY time ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+
+    if row is not None:
+        sample = exhaustTemperatureGradientSample(id=row[0], time=row[1], gradient=row[2])
+    else:
+        sample = None
+
+    cursor.close()
+    conn.close()
+
+    return sample
+
+
+def getUnprocessedExhaustSample():
+    """ This function reads the first element of the oelheizung.abgastemperatur table which
+    has a processed value of NULL and returns it as an AbgasTemperatur object.
+      After reading the sample, it sets the processed value to the current timestamp to mark it as processed. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), temperatur
+        FROM oelheizung.abgastemperatur
+        WHERE processed IS NULL OR processed = FALSE
+        ORDER BY time ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+
+    if row is not None:
+        sample = exhaustTemperatureSample(id=row[0], time=row[1], temperature=row[2])
+    else:
+        sample = None
+
+    cursor.close()
+    conn.close()
+
+    return sample
+
+def resetProcessedFlagForAllSamples():
+    """ This function resets the processed flag for all samples in the database to NULL. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.abgastemperatur
+        SET processed = NULL
+    """)
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    print("Reset processed flag for all samples in the database.")
+
+
+def markExhaustSampleAsProcessed(sample_id: int):
+    """ Marks the exhaust temperature sample with the given id as processed in the database. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.abgastemperatur
+        SET processed = TRUE
+        WHERE id = %s
+    """, (sample_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def burnerStatusSampleExists(sample_id: int) -> bool:
+    """ Checks if a burner status sample with the given id exists in the brennerStatus table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.brennerStatus
+        WHERE id = %s
+        LIMIT 1
+    """, (sample_id,))
+
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return result is not None
+
+
+def exhaustSampleExists(sample_id: int) -> bool:
+    """ Checks if an exhaust temperature sample with the given id exists in the database. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.abgastemperatur
+        WHERE id = %s
+        LIMIT 1
+    """, (sample_id,))
+
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return result is not None
+
 
 def isNewExhaustSampleAvailable() -> bool:
     """
@@ -65,9 +681,12 @@ def isNewExhaustSampleAvailable() -> bool:
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT 1
-        FROM oelheizung.abgastemperatur
-        WHERE processed IS NULL
+        SELECT a.id
+        FROM oelheizung.abgastemperatur a
+        WHERE (a.processed IS NULL OR a.processed = FALSE)
+          AND EXISTS (
+              SELECT 1 FROM oelheizung.abgastemperatur b WHERE b.id = a.id + 1
+          )
         LIMIT 1
     """)
 
@@ -78,6 +697,68 @@ def isNewExhaustSampleAvailable() -> bool:
     conn.close()
 
     return new_samples_available
+
+
+def isNewGradientSampleAvailable() -> bool:
+    """
+    Checks if a new exhaust temperature gradient sample is available in the database
+    by reading the first element which has a oelheizung.abgastemperaturGradient.processed set to NULL.
+
+    Returns:
+        bool: True if at least one new exhaust temperature gradient sample is available, False otherwise.
+
+    Author
+    -----
+    Marcel Riebel
+    """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.abgastemperaturGradient
+        WHERE processed IS NULL OR processed = FALSE
+        LIMIT 1
+    """)
+
+    result = cursor.fetchone()
+    new_samples_available = result is not None
+
+    cursor.close()
+    conn.close()
+
+    return new_samples_available
+
+
+def isNewBurnerStatusSampleAvailable() -> bool:
+    """ Checks if a new burner status sample is available in the brennerStatus table that has not been processed yet. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.brennerStatus
+        WHERE processed IS NULL OR processed = FALSE
+        LIMIT 1
+    """)
+
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return result is not None
 
 
 def leseAbgasTemperatur():
@@ -103,128 +784,11 @@ def leseAbgasTemperatur():
     rows = cursor.fetchall()
 
     for ts, temperatur in rows:
-        AbgasTemperaturDaten.append(AbgasTemperatur(time=ts, temperatur=temperatur))
+        exhaustTemperatureData.append(exhaustTemperatureSample(time=ts, temperatur=temperatur))
 
     cursor.close()
     conn.close()
 
 
-def berechneBrennerStatus():
-    global AbgasTemperaturDaten
-
-    # Berechnung des Brennerstatus basierend auf dem Temperaturgradienten
-    for index, abgas in enumerate(AbgasTemperaturDaten):
-        startTemperatur = abgas.temperatur
-        startZeitstempel = abgas.time
-        stopTemperatur = AbgasTemperaturDaten[index + 1].temperatur if index + 1 < len(AbgasTemperaturDaten) else None
-        stopZeitstempel = AbgasTemperaturDaten[index + 1].time if index + 1 < len(AbgasTemperaturDaten) else None
-
-        # Berechnung des Temperaturgradienten zwischen den aktuellen und nächsten Messwerten
-        if stopTemperatur is not None:
-            temperaturDifferenz = stopTemperatur - startTemperatur
-            zeitDifferenz = stopZeitstempel - startZeitstempel
-            temperaturGradient = temperaturDifferenz / zeitDifferenz if zeitDifferenz != 0 else 0
-            abgas.temperaturGradient = temperaturGradient
-            AbgasTemperaturDaten[index].temperaturGradient = temperaturGradient
-
-            if abgas.temperaturGradient > 0.5:
-                abgas.brennerStatus = True
-            elif abgas.temperaturGradient < -0.5:
-                abgas.brennerStatus = False
-
-    # Fehlende Brennerstatus-Werte mit vorherigen Werten auffüllen
-    for index, abgas in enumerate(AbgasTemperaturDaten):
-        if abgas.brennerStatus is None:
-            if index > 0 and AbgasTemperaturDaten[index - 1].brennerStatus is not None:
-                abgas.brennerStatus = AbgasTemperaturDaten[index - 1].brennerStatus
-
-
-def analysiereBrennerNutzung():
-    global AbgasTemperaturDaten, BrennerStatusDaten, BrennerStatistikDaten
-
-    BrennerStatusDaten.clear()
-
-    aktuellerStatus = None
-    startZeit = None
-
-    for abgas in AbgasTemperaturDaten:
-        if abgas.brennerStatus != aktuellerStatus:
-            if aktuellerStatus is not None:
-                BrennerStatusDaten.append(BrennerStatus(time=startZeit, status=aktuellerStatus, period=abgas.time - startZeit))
-            aktuellerStatus = abgas.brennerStatus
-            startZeit = abgas.time
-
-    if aktuellerStatus is not None:
-        BrennerStatusDaten.append(BrennerStatus(time=startZeit, status=aktuellerStatus, period=AbgasTemperaturDaten[-1].time - startZeit))
-
-    print("Brennerstatus Perioden:")
-    for status in BrennerStatusDaten:
-        print(f"Startzeit: {status.time}, Status: {'An' if status.status else 'Aus'}, Dauer: {status.period} Sekunden")
-
-
-    for brennerStatus in BrennerStatusDaten:
-        if brennerStatus.status is True:
-            BrennerStatistikDaten.gesamtdauerAktiv += brennerStatus.period if brennerStatus.period is not None else 0
-            BrennerStatistikDaten.starts += 1
-        else:
-            BrennerStatistikDaten.gesamtdauerInaktiv += brennerStatus.period if brennerStatus.period is not None else 0
-            BrennerStatistikDaten.pausen += 1
-
-    if BrennerStatistikDaten.starts > 0:
-        BrennerStatistikDaten.mittlereDauerAktiv = BrennerStatistikDaten.gesamtdauerAktiv / BrennerStatistikDaten.starts
-    if BrennerStatistikDaten.pausen > 0:
-        BrennerStatistikDaten.mittlereDauerInaktiv = BrennerStatistikDaten.gesamtdauerInaktiv / BrennerStatistikDaten.pausen
-
-    print("\nBrennerstatistik:")
-    print(f"Gesamtdauer Aktiv: {sek_zu_hms(BrennerStatistikDaten.gesamtdauerAktiv)}")
-    print(f"Gesamtdauer Inaktiv: {sek_zu_hms(BrennerStatistikDaten.gesamtdauerInaktiv)}")
-    print(f"Anzahl Starts: {BrennerStatistikDaten.starts}")
-    print(f"Anzahl Pausen: {BrennerStatistikDaten.pausen}")
-    print(f"Mittlere Dauer Aktiv: {sek_zu_hms(BrennerStatistikDaten.mittlereDauerAktiv)}")
-    print(f"Mittlere Dauer Inaktiv: {sek_zu_hms(BrennerStatistikDaten.mittlereDauerInaktiv)}")
-
-
-def sek_zu_hms(sekunden: float) -> str:
-        sekunden = int(sekunden)
-        h, rest = divmod(sekunden, 3600)
-        m, s = divmod(rest, 60)
-        return f"{h}h {m}m {s}s"
-
-def plotBrennerStatus():
-    global AbgasTemperaturDaten
-
-    times = [abgas.time for abgas in AbgasTemperaturDaten]
-    gradients = [abgas.temperaturGradient for abgas in AbgasTemperaturDaten]
-    temperatur = [abgas.temperatur for abgas in AbgasTemperaturDaten]
-    statuses = [abgas.brennerStatus for abgas in AbgasTemperaturDaten]
-
-    fig, (ax1, ax_grad) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-    ax1.plot(times, temperatur, label='Temperatur (°C)', color='green')
-    ax1.set_ylabel('Temperatur (°C)')
-    ax1.grid()
-
-    ax1_right = ax1.twinx()
-    ax1_right.plot(times, statuses, label='Brennerstatus (1=An, 0=Aus)', color='red', drawstyle='steps-post')
-    ax1_right.scatter(times, statuses, color='red', s=15, zorder=5)
-    ax1_right.set_ylabel('Brennerstatus (0=Aus, 1=An)')
-    ax1_right.set_ylim(-0.5, 1.5)
-    ax1_right.set_yticks([0, 1])
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax1_right.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2)
-    ax1.set_title('Brennerstatus Analyse basierend auf Temperaturgradienten')
-
-    ax_grad.plot(times, gradients, label='Temperaturgradient (°C/Sekunde)', color='blue')
-    ax_grad.set_xlabel('Zeit (Unix Timestamp)')
-    ax_grad.set_ylabel('Temperaturgradient (°C/s)')
-    ax_grad.legend()
-    ax_grad.grid()
-
-    fig.tight_layout()
-    plt.show()
-
-
 if __name__ == "__main__":
-    brennerStatusAnalyse()
+    exhaustTemperatureAnalysis()
