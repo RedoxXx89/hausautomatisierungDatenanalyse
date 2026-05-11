@@ -1,9 +1,7 @@
 import dataclasses
 import mysql.connector
 import matplotlib.pyplot as plt
-from mysqlSecrets import MySQLSecrets
-
-secrets = MySQLSecrets()
+from mysqlSecrets import databaseLoginSecrets, MySQLSecrets
 
 @dataclasses.dataclass
 class AbgasTemperatur:
@@ -37,10 +35,49 @@ AbgasTemperaturDaten: list[AbgasTemperatur] = []
 def brennerStatusAnalyse():
     global AbgasTemperaturDaten
 
-    leseAbgasTemperatur()
-    berechneBrennerStatus()
-    analysiereBrennerNutzung()
-    plotBrennerStatus()
+    print(isNewExhaustSampleAvailable())
+
+
+    #leseAbgasTemperatur()
+    #berechneBrennerStatus()
+    #analysiereBrennerNutzung()
+    #plotBrennerStatus()
+
+def isNewExhaustSampleAvailable() -> bool:
+    """
+    Checks if a new exhaust temperature sample is available in the database
+    by reading the first element which has a oelheizung.processed set to NULL.
+
+    Returns:
+        bool: True if at least one new exhaust temperature sample is available, False otherwise.
+
+    Author
+    -----
+    Marcel Riebel
+    """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.abgastemperatur
+        WHERE processed IS NULL
+        LIMIT 1
+    """)
+
+    result = cursor.fetchone()
+    new_samples_available = result is not None
+
+    cursor.close()
+    conn.close()
+
+    return new_samples_available
 
 
 def leseAbgasTemperatur():
@@ -48,10 +85,10 @@ def leseAbgasTemperatur():
     AbgasTemperaturDaten.clear()
 
     conn = mysql.connector.connect(
-        host=secrets.host,
-        user=secrets.user,
-        password=secrets.password,
-        database=secrets.database_oelheizung
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
     )
 
     cursor = conn.cursor()

@@ -1,1 +1,3 @@
 /src/mysqlSecrets.py
+/src/__pycache__/*.pyc
+/src/__pycache__/*.pyo
