@@ -1,3 +1,4 @@
 /src/mysqlSecrets.py
+/src/weatherSecrets.py
 /src/__pycache__/*.pyc
 /src/__pycache__/*.pyo

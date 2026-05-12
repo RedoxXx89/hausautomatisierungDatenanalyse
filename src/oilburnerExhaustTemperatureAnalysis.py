@@ -32,17 +32,17 @@ class oilBurnerStatus:
     status: bool
 
 @dataclasses.dataclass
+class oilBurnerStatusEvent:
+    id: int        # ID of the database entry (same as the brennerStatus sample id)
+    time: int      # Unix Timestamp of the status change
+    status: bool   # new status after the change
+
+@dataclasses.dataclass
 class oilBurnerPulse:
     id: int        # ID of the database entry
     time: int      # Unix Timestamp (start of the status period)
     status: bool
     duration: int  # duration in seconds   
-
-@dataclasses.dataclass
-class oilBurnerStatusEvent:
-    id: int        # ID of the database entry (same as the brennerStatus sample id)
-    time: int      # Unix Timestamp of the status change
-    status: bool   # new status after the change
 
 @dataclasses.dataclass
 class oilBurnerStatistics:
@@ -73,6 +73,10 @@ def exhaustTemperatureAnalysis():
     if isNewBurnerStatusSampleAvailable():
         print("New burner status sample available, processing...")
         processNewBurnerStatusSamples()
+
+    if isNewBurnerStatusEventAvailable():
+        print("New burner status event available, processing...")
+        processNewBurnerStatusEventSamples()
 
 
 def processNewGradientSamples():
@@ -134,6 +138,56 @@ def processNewBurnerStatusSample():
         print(f"Burner status sample {newSample.id} marked as processed.")
     else:
         print(f"Previous burner status sample {newSample.id-1} not found, skipping processing for now.")
+
+def processNewBurnerStatusEventSamples():
+    samplesProcessed = 0
+    while isNewBurnerStatusEventAvailable():
+        if samplesProcessed >= PAR_DEFINE_MAX_SAMPLES_PROCESSED_PER_RUN:
+            print(f"Processed {samplesProcessed} burner status event samples, reaching the maximum limit for this run.")
+            break
+        else:
+            processNewBurnerStatusEventSample()
+            samplesProcessed += 1
+
+
+def processNewBurnerStatusEventSample():
+    newSample = getUnprocessedBurnerStatusEventSample()
+
+    print(f"Processing burner status event ID {newSample.id}, status={'ON' if newSample.status else 'OFF'} at {datetime.datetime.fromtimestamp(newSample.time).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if newSample.status == True:
+        # burner started — look for the next OFF event to calculate the pulse duration
+        offEvent = getNextBurnerStatusOffEvent(after_id=newSample.id)
+
+        if offEvent is not None:
+            duration = offEvent.time - newSample.time
+            print(f"Found OFF event (ID {offEvent.id}), pulse duration: {duration}s")
+
+            pulse = oilBurnerPulse(id=newSample.id, time=newSample.time, status=True, duration=duration)
+            insertBurnerPulseSample(pulse)
+            print("Inserted burner pulse into the database.")
+
+            markBurnerStatusEventAsProcessed(newSample.id)
+            print(f"Burner status event {newSample.id} marked as processed.")
+        else:
+            print("No OFF event found yet, skipping pulse creation for now.")
+    elif newSample.status == False:
+        # burner stopped — look for the next ON event to calculate the inactive pulse duration
+        onEvent = getNextBurnerStatusOnEvent(after_id=newSample.id)
+
+        if onEvent is not None:
+            duration = onEvent.time - newSample.time
+            print(f"Found ON event (ID {onEvent.id}), inactive pulse duration: {duration}s")
+
+            pulse = oilBurnerPulse(id=newSample.id, time=newSample.time, status=False, duration=duration)
+            insertBurnerPulseSample(pulse)
+            print("Inserted inactive burner pulse into the database.")
+
+            markBurnerStatusEventAsProcessed(newSample.id)
+            print(f"Burner status event {newSample.id} marked as processed.")
+        else:
+            print("No ON event found yet, skipping inactive pulse creation for now.")
+
 
 def processGradientSample():
     newSample = getUnprocessedGradientSample()
@@ -469,6 +523,133 @@ def getFirstGradientSampleId() -> int | None:
     return row[0] if row else None
 
 
+def getNextBurnerStatusOffEvent(after_id: int) -> oilBurnerStatusEvent | None:
+    """ Returns the next OFF (status=False) burner status event with id > after_id, or None if not found. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), status
+        FROM oelheizung.brennerStatusEvent
+        WHERE id > %s AND status = FALSE
+        ORDER BY id ASC
+        LIMIT 1
+    """, (after_id,))
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is not None:
+        return oilBurnerStatusEvent(id=row[0], time=row[1], status=bool(row[2]))
+    return None
+
+
+def getNextBurnerStatusOnEvent(after_id: int) -> oilBurnerStatusEvent | None:
+    """ Returns the next ON (status=True) burner status event with id > after_id, or None if not found. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), status
+        FROM oelheizung.brennerStatusEvent
+        WHERE id > %s AND status = TRUE
+        ORDER BY id ASC
+        LIMIT 1
+    """, (after_id,))
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is not None:
+        return oilBurnerStatusEvent(id=row[0], time=row[1], status=bool(row[2]))
+    return None
+
+
+def insertBurnerPulseSample(pulse: oilBurnerPulse):
+    """ Inserts an oil burner pulse into the brennerPulse table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO oelheizung.brennerPulse (id, startTime, status, duration)
+        VALUES (%s, FROM_UNIXTIME(%s), %s, %s)
+    """, (pulse.id, pulse.time, pulse.status, pulse.duration))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def markBurnerStatusEventAsProcessed(event_id: int):
+    """ Marks the burner status event with the given id as processed in the brennerStatusEvent table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE oelheizung.brennerStatusEvent
+        SET processed = TRUE
+        WHERE id = %s
+    """, (event_id,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def getUnprocessedBurnerStatusEventSample() -> oilBurnerStatusEvent | None:
+    """ Reads the first unprocessed burner status event sample from the brennerStatusEvent table. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, UNIX_TIMESTAMP(time), status
+        FROM oelheizung.brennerStatusEvent
+        WHERE processed IS NULL OR processed = FALSE
+        ORDER BY time ASC
+        LIMIT 1
+    """)
+
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is not None:
+        return oilBurnerStatusEvent(id=row[0], time=row[1], status=bool(row[2]))
+    return None
+
+
 def getUnprocessedBurnerStatusSample() -> oilBurnerStatus | None:
     """ Reads the first unprocessed burner status sample from the brennerStatus table. """
     conn = mysql.connector.connect(
@@ -751,6 +932,35 @@ def isNewBurnerStatusSampleAvailable() -> bool:
         SELECT 1
         FROM oelheizung.brennerStatus
         WHERE processed IS NULL OR processed = FALSE
+        LIMIT 1
+    """)
+
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    return result is not None
+
+
+def isNewBurnerStatusEventAvailable() -> bool:
+    """ Checks if a new burner status event is available in the brennerStatusEvent table that has not been processed yet. """
+    conn = mysql.connector.connect(
+        host=databaseLoginSecrets.host,
+        user=databaseLoginSecrets.user,
+        password=databaseLoginSecrets.password,
+        database=databaseLoginSecrets.database_oelheizung
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT 1
+        FROM oelheizung.brennerStatusEvent a
+        WHERE (a.processed IS NULL OR a.processed = FALSE)
+          AND EXISTS (
+              SELECT 1 FROM oelheizung.brennerStatusEvent b
+              WHERE b.id > a.id AND b.status != a.status
+          )
         LIMIT 1
     """)
 
